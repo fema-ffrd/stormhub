@@ -10,6 +10,8 @@ if __name__ == "__main__":
     catalog_id = "watershed_USGS_Gage_Catalog"
     local_directory = "/path/for/created/stac"
     watershed = "path/of/watershed.geojson"
+    swe_zarr_folder = "/workspaces/stormhub/data/0_source/swe/zarr"
+    drainage_area_geojson_path = "/workspaces/stormhub/data/0_source/basins/gage_basins.geojson"
 
     gage_catalog = new_gage_catalog(
         catalog_id,
@@ -22,10 +24,8 @@ if __name__ == "__main__":
     collection = new_gage_collection(gage_catalog, gage_numbers, local_directory)
 
     # Optionally add average SWE data to each gage item for each AMS event
-    # add_ams_swe_to_gage_collection(
-    #     gage_collection = collection,
-    #     drainage_area_geojson_path = "path/to/drainage_areas.geojson",
-    #     swe_zarr_path = "s3://path/to/swe.zarr")
-
-    # Optionally add calibration events to the gage collection
-    # add_calibration_events_to_collection(collection, tolerance_days=7, top_n_years=15)
+    add_ams_swe_to_gage_collection(
+        gage_collection = gage_catalog,
+        drainage_area_geojson_path = drainage_area_geojson_path,
+        swe_zarr_path = swe_zarr_folder,
+        swe_threshold_mm = 10)

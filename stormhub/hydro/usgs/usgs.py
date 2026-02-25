@@ -15,6 +15,7 @@ from stormhub.hydro.utils import log_pearson_iii
 import xarray as xr
 import pandas as pd
 import shapely
+import numpy as np
 
 
 from stormhub.hydro.plots import (
@@ -31,8 +32,8 @@ def prepare_swe_data(
     start_date: datetime,
     end_date: datetime,
     crs: str = "EPSG:4326",
-    x_dim: str = "lon",
-    y_dim: str = "lat",
+    x_dim: str = "x",
+    y_dim: str = "y",
 ):
     """Slices time and sets spatial dimensions/CRS."""
     swe_subset = swe_dataarray.sel(time=slice(start_date, end_date))
@@ -45,11 +46,13 @@ def prepare_swe_data(
 
 def clip_swe_to_geometry(swe_dataarray: xr.DataArray, geometry: shapely.geometry.Polygon, crs: str):
     """Clips the DataArray to a specific geometry."""
-    return swe_dataarray.rio.clip([geometry], crs)
+    return swe_dataarray.rio.clip([geometry], crs, drop=True, all_touched=True)
 
 
-def calculate_spatial_mean(clipped_da: xr.DataArray, x_dim: str = "lon", y_dim: str = "lat"):
+def calculate_spatial_mean(clipped_da: xr.DataArray, x_dim: str = "x", y_dim: str = "y"):
     """Calculate spatial mean and formats to DataFrame."""
+    # Mask out non-positive values
+    clipped_da = clipped_da.where(clipped_da > 0)  
     daily_mean = clipped_da.mean(dim=[y_dim, x_dim])
     df = daily_mean.to_dataframe().reset_index()
     return df[["time", "SWE"]].rename(columns={"SWE": "daily_mean_swe_mm"})
@@ -61,8 +64,8 @@ def avg_daily_swe(
     start_date: datetime,
     end_date: datetime,
     crs: str = "EPSG:4326",
-    da_xdim: str = "lon",
-    da_ydim: str = "lat",
+    da_xdim: str = "x",
+    da_ydim: str = "y",
 ):
     """Calculate daily average SWE over a specified geometry and time range.
 
@@ -97,6 +100,7 @@ def add_ams_swe_to_gage_collection(
     swe_zarr_path: str,
     swe_variable_name: str = "SWE",
     days_in_event: int = 30,
+    swe_threshold_mm: int = 10
 ):
     """Add average SWE assets to gage items in the given collection. Uses AMS parquet file for each gage to determine event dates.
 
@@ -106,81 +110,158 @@ def add_ams_swe_to_gage_collection(
         swe_zarr_path (str): Local or S3 path to the SWE Zarr dataset.
         swe_variable_name (str): Name of the SWE variable in the dataset.
         days_in_event (int): Number of days to look back for each AMS event.
+        swe_threshold_mm (int): Threshold for maximum decrease in SWE during look ahead period to classify flood type.
 
     Returns
     -------
         None
     """
-    snow_ds = xr.open_zarr(swe_zarr_path, consolidated=True)
-    swe_da = snow_ds[swe_variable_name]
-
     da_polygons = gpd.read_file(drainage_area_geojson_path)
+    da_polygons = da_polygons.to_crs(epsg=4326)
 
     for item in gage_collection.get_all_items():
-        try:
-            gage_number = item.id
-            item_href = item.get_self_href()
-            item_dir = item_href.rpartition("/")[0]
+        gage_number = item.id
+        item_href = item.get_self_href()
+        item_dir = item_href.rpartition("/")[0]
 
-            ams_href = None
-            for asset in item.get_assets().values():
-                if asset.href.endswith("ams.pq"):
-                    ams_href = asset.href
-                    break
+        ams_href = None
+        for asset in item.get_assets().values():
+            if asset.href.endswith("ams.pq"):
+                ams_href = asset.href
+                break
 
-            if ams_href is None:
-                logging.warning(f"No AMS asset found for gage {gage_number}, skipping.")
-                continue
+        if ams_href is None:
+            logging.warning(f"No AMS asset found for gage {gage_number}, skipping.")
+            continue
 
-            ams_path = f"{item_dir}/{ams_href.split('/')[-1]}"
-            logging.info(f"Processing Gage: {gage_number} from {ams_path}")
-            if os.path.exists(ams_path):
-                ams_pq = pd.read_parquet(ams_path)
+        ams_path = f"{item_dir}/{ams_href.split('/')[-1]}"
+        logging.info(f"Processing Gage: {gage_number} from {ams_path}")
+        if os.path.exists(ams_path):
+            ams_pq = pd.read_parquet(ams_path)
+        else:
+            logging.warning(f"AMS file {ams_path} does not exist, skipping gage {gage_number}.")
+            continue
+
+        single_gage_da = da_polygons[da_polygons["gage_ids"] == gage_number]
+        if single_gage_da.empty:
+            logging.warning(f"No drainage area found for gage {gage_number}, skipping.")
+            continue
+        drainage_area_size = single_gage_da['area_sqmi'].values[0]
+        drainage_area_bounds = single_gage_da.bounds
+        drainage_area_geom = [single_gage_da.geometry.values[0]]
+
+        ams_dates = ams_pq.index
+        swe_results = []
+
+        for date in ams_dates:
+            logging.info(f"Processing SWE for date: {date}")
+            end_date = date.tz_localize(None)
+            start_date = end_date - timedelta(days=days_in_event)
+
+            swe_start = start_date.isoformat()
+            swe_end = end_date.isoformat()
+
+            # format to datetime
+            swe_start_dt = datetime.fromisoformat(swe_start)
+            swe_end_dt = datetime.fromisoformat(swe_end)
+
+            # determine the water year from the start date
+            start_month = start_date.month
+            start_year = start_date.year
+            if start_month >= 10:
+                water_year = start_year + 1
             else:
-                logging.warning(f"AMS file {ams_path} does not exist, skipping gage {gage_number}.")
+                water_year = start_year
+
+            zarr_path = os.path.join(swe_zarr_path, f"4km_SWE_Depth_WY{water_year}_v01.zarr")
+            if not Path(zarr_path).exists():
+                logging.warning(f"SWE Zarr path {zarr_path} does not exist, skipping date {end_date}.")
                 continue
+            snow_ds = xr.open_zarr(zarr_path, consolidated=True)
+            swe_da = snow_ds[swe_variable_name]
 
-            single_gage_da = da_polygons[da_polygons["Name"] == gage_number]
-            drainage_area = single_gage_da.geometry.values[0]
+            # Rename lat/lon to y/x for rioxarray compatibility, then assign CRS
+            swe_da = swe_da.rename({"lat": "y", "lon": "x"})
+            swe_da = swe_da.rio.write_crs("EPSG:4326")
 
-            ams_dates = ams_pq.index
-            swe_results = []
+            try:
+                # Extract scalar bounds values
+                minx, miny, maxx, maxy = (
+                    drainage_area_bounds.minx.item(),
+                    drainage_area_bounds.miny.item(),
+                    drainage_area_bounds.maxx.item(),
+                    drainage_area_bounds.maxy.item(),
+                )
+                # Check coordinate order for proper slicing
+                y_ascending = float(swe_da.y[0]) < float(swe_da.y[-1])
+                y_slice = slice(miny, maxy) if y_ascending else slice(maxy, miny)
+                
+                swe_da = swe_da.sel(
+                    time=slice(swe_start_dt, swe_end_dt),
+                    x=slice(minx, maxx),
+                    y=y_slice,
+                )
+            except Exception as e:
+                logging.error(f"Error slicing using bounds {drainage_area_bounds}: {e}")
+                print(f"Number of drainage area bounds: {drainage_area_bounds}")
+                raise e
 
-            for date in ams_dates:
-                logging.info(f"Processing SWE for date: {date}")
-                end_date = date.tz_localize(None)
-                start_date = end_date - timedelta(days=days_in_event)
-
-                try:
-                    daily_swe = avg_daily_swe(drainage_area, swe_da, start_date=start_date, end_date=end_date)
-
-                    daily_swe["ams_ref_date"] = end_date
-
-                    swe_results.append(daily_swe)
-                except Exception as e:
-                    logging.error(f"Skipping {end_date}: {e}")
-
-            if len(swe_results) == 0:
-                logging.warning(f"No SWE results for gage {gage_number}, skipping asset addition.")
+            # Check if subsection has data before clipping
+            if swe_da.size == 0 or swe_da.x.size == 0 or swe_da.y.size == 0:
+                logging.warning(f"No SWE data within drainage area bounds {drainage_area_bounds} skipping.")
                 continue
+            try:
+                # Clip to geometry
+                clipped = swe_da.rio.clip(drainage_area_geom, drop=True, all_touched=True)
+            except Exception as e:
+                logging.error(f"Error clipping SWE data for gage {gage_number}: {e}")
+                continue
+            # Aggregate
+            daily_swe = calculate_spatial_mean(clipped)
+            daily_swe["ams_ref_date"] = end_date
+            swe_results.append(daily_swe)
 
-            combined_swe_df = pd.concat(swe_results, ignore_index=True)
-            swe_fn = f"avg_ams_swe_{gage_number}.pq"
-            combined_swe_df.to_parquet(f"{item_dir}/{swe_fn}")
+        if len(swe_results) == 0:
+            logging.warning(f"No SWE results for gage {gage_number}, skipping asset addition.")
+            continue
 
-            item.add_asset(
-                "avg_ams_swe",
-                Asset(
-                    href=f"{swe_fn}",
-                    media_type="application/parquet",
-                    roles=["data"],
-                    title="Average SWE",
-                    description="Average daily SWE over gage drainage area per AMS Event",
-                ),
-            )
-            item.save_object()
-        except Exception as e:
-            logging.error(f"Error processing gage {gage_number}: {e}")
+        combined_swe_df = pd.concat(swe_results, ignore_index=True)
+        swe_fn = f"avg_ams_swe_{gage_number}.pq"
+        combined_swe_df['daily_mean_swe_mm'] = combined_swe_df['daily_mean_swe_mm'].fillna(0)
+        combined_swe_df.to_parquet(f"{item_dir}/{swe_fn}")
+
+        # determine look ahead period based on drainage area size
+        look_ahead = int(5 + np.log(drainage_area_size))
+        if look_ahead > 30:
+            raise ValueError(f"Calculated look ahead period of {look_ahead} days exceeds maximum of 30 days. Please check drainage area size for gage {gage_number}.")
+
+        swe_change = {}
+        for ams_date in combined_swe_df['ams_ref_date'].unique().tolist():
+            subset = combined_swe_df[combined_swe_df['ams_ref_date'] == ams_date]
+            change = subset['daily_mean_swe_mm'].diff().fillna(0)
+            swe_change[ams_date] = change[-look_ahead:].sum()
+
+        swe_keys = list(swe_change.keys())
+        flood_type_df = pd.DataFrame({
+            "ams_ref_date": swe_keys,
+            "max_swe_change_mm": list(swe_change.values()),
+            "look_ahead_days": look_ahead
+        })
+        flood_type_df['flood-type'] = flood_type_df['max_swe_change_mm'].apply(lambda x: 'rain-on-snow' if x < -swe_threshold_mm else 'rain')
+        swe_types = f"flood_types_{gage_number}.pq"
+        flood_type_df.to_parquet(f"{item_dir}/{swe_types}")
+
+        item.add_asset(
+            "avg_ams_swe",
+            Asset(
+                href=f"{swe_fn}",
+                media_type="application/parquet",
+                roles=["data"],
+                title="Average SWE",
+                description="Average daily SWE over gage drainage area per AMS Event",
+            ),
+        )
+        item.save_object()
 
 
 class UsgsGage(Item):
